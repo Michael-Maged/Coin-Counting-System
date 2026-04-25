@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 import pytest
 
-from coin_detector import (
+from code.coin_detector import (
     Coin,
     CoinDetector,
     DetectionResult,

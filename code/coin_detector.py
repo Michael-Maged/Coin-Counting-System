@@ -55,12 +55,12 @@ class DetectionResult:
 
 US_COIN_TABLE = [
     # label,    value,  color,     min_r,  max_r
-    ("dime",    0.10,  "silver",   0.70,   0.89),
-    ("penny",   0.01,  "copper",   0.90,   1.10),
-    ("nickel",  0.05,  "silver",   1.05,   1.25),
-    ("quarter", 0.25,  "silver",   1.20,   1.50),
-    ("half",    0.50,  "silver",   1.45,   1.80),
-    ("dollar",  1.00,  "gold",     1.60,   2.20),
+    ("dime",    0.10,  "silver",   0.70,   0.92),
+    ("penny",   0.01,  "copper",   0.75,   1.15),
+    ("nickel",  0.05,  "silver",   0.93,   1.15),
+    ("quarter", 0.25,  "silver",   1.10,   1.40),
+    ("half",    0.50,  "silver",   1.35,   1.80),
+    ("dollar",  1.00,  "gold",     1.50,   2.20),
 ]
 
 # Color group boundaries in HSV space
@@ -85,7 +85,7 @@ def _bgr_to_color_name(bgr: Tuple[float, float, float]) -> str:
     ('copper', 'gold', 'silver') using HSV thresholds.
     """
     # Convert a single pixel BGR->HSV via OpenCV
-    pixel = np.uint8([[list(bgr)]])
+    pixel = np.array([[list(bgr)]], dtype=np.uint8)
     hsv = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)[0][0]
     h, s, v = int(hsv[0]), int(hsv[1]), int(hsv[2])
 
@@ -127,31 +127,38 @@ def _classify_coin(radius: int, color_name: str,
     Return (label, value) by matching *radius* against the relative-size
     table and verifying color when the table specifies one.
 
-    Falls back to a size-only match if no colour match is found.
+    Strategy:
+    1. Exact match: size range AND color both match.
+    2. Color-only match: color matches, pick closest ratio entry.
+    3. Size-only fallback: pick the entry whose range contains the ratio.
+    4. Closest ratio: pick the entry with the nearest midpoint.
     """
     if median_radius <= 0:
         return "unknown", 0.0
 
     ratio = radius / median_radius
 
-    best_label, best_value = "unknown", 0.0
-    best_size_label, best_size_value = "unknown", 0.0
+    # 1. Exact match (size range + color)
+    for label, value, color_group, min_r, max_r in coin_table:
+        if min_r <= ratio <= max_r and (color_group == color_name or color_group == "any"):
+            return label, value
 
+    # 2. Color matches — pick closest midpoint among color-matching entries
+    color_candidates = [(label, value, (min_r + max_r) / 2)
+                        for label, value, color_group, min_r, max_r in coin_table
+                        if color_group == color_name or color_group == "any"]
+    if color_candidates:
+        best = min(color_candidates, key=lambda t: abs(t[2] - ratio))
+        return best[0], best[1]
+
+    # 3. Size-only fallback
     for label, value, color_group, min_r, max_r in coin_table:
         if min_r <= ratio <= max_r:
-            best_size_label = label
-            best_size_value = value
-            if color_group == color_name or color_group == "any":
-                best_label = label
-                best_value = value
-                break   # exact match (size + colour)
+            return label, value
 
-    if best_label == "unknown" and best_size_label != "unknown":
-        # Size matched but colour did not – use size-only result
-        best_label = best_size_label
-        best_value = best_size_value
-
-    return best_label, best_value
+    # 4. Closest ratio overall
+    best = min(coin_table, key=lambda row: abs((row[3] + row[4]) / 2 - ratio))
+    return best[0], best[1]
 
 
 # ---------------------------------------------------------------------------
@@ -190,10 +197,10 @@ class CoinDetector:
         self,
         coin_table: Optional[list] = None,
         dp: float = 1.2,
-        min_dist_factor: float = 0.05,
+        min_dist_factor: float = 0.10,
         param1: int = 100,
-        param2: int = 30,
-        min_radius_factor: float = 0.02,
+        param2: int = 70,
+        min_radius_factor: float = 0.04,
         max_radius_factor: float = 0.35,
         blur_ksize: int = 7,
     ):
@@ -209,6 +216,29 @@ class CoinDetector:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def _watershed_centers(self, gray: np.ndarray) -> Optional[np.ndarray]:
+        """Use thresholding + distance transform + watershed to find coin
+        centres. Returns (N,2) array of (x,y) or None if fewer than 1 found."""
+        _, thresh = cv2.threshold(gray, 0, 255,
+                                  cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # Remove noise
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
+
+        dist = cv2.distanceTransform(thresh, cv2.DIST_L2, 5)
+        _, sure_fg = cv2.threshold(dist, 0.5 * dist.max(), 255, 0)
+        sure_fg = sure_fg.astype(np.uint8)
+
+        n_labels, markers = cv2.connectedComponents(sure_fg)
+        if n_labels < 2:
+            return None
+        # Return centroid of each foreground label
+        centers = []
+        for label in range(1, n_labels):
+            ys, xs = np.where(markers == label)
+            centers.append([int(xs.mean()), int(ys.mean())])
+        return np.array(centers, dtype=int)
 
     def detect(self, image_source) -> DetectionResult:
         """
@@ -269,13 +299,26 @@ class CoinDetector:
         return cv2.GaussianBlur(gray, (ksize, ksize), 2)
 
     def _hough_detect(self, image: np.ndarray, gray: np.ndarray):
-        """Run cv2.HoughCircles and return the (N, 3) circle array or None."""
+        """Run cv2.HoughCircles, return refined (N, 3) circle array or None."""
         h, w = image.shape[:2]
         short_side = min(h, w)
 
-        min_dist = max(1, int(short_side * self.min_dist_factor))
         min_radius = max(1, int(short_side * self.min_radius_factor))
         max_radius = int(short_side * self.max_radius_factor)
+
+        # Use watershed to estimate coin count and set minDist accordingly
+        ws_centers = self._watershed_centers(gray)
+        if ws_centers is not None and len(ws_centers) >= 2:
+            # Compute minimum pairwise distance between watershed centres
+            from scipy.spatial.distance import cdist
+            dists = cdist(ws_centers, ws_centers)
+            np.fill_diagonal(dists, np.inf)
+            min_dist = max(1, int(dists.min() * 0.8))
+        else:
+            min_dist = max(1, int(short_side * self.min_dist_factor))
+
+        # Scale param2 down for small images (target: param2=70 at 317px, 45 at 135px)
+        param2 = max(10, int(self.param2 * (0.35 + 0.65 * min(1.0, short_side / 317))))
 
         circles = cv2.HoughCircles(
             gray,
@@ -283,15 +326,33 @@ class CoinDetector:
             dp=self.dp,
             minDist=min_dist,
             param1=self.param1,
-            param2=self.param2,
+            param2=param2,
             minRadius=min_radius,
             maxRadius=max_radius,
         )
 
         if circles is not None:
             circles = np.round(circles[0]).astype(int)
+            circles = self._refine_radii(gray, circles)
 
         return circles
+
+    def _refine_radii(self, gray: np.ndarray, circles: np.ndarray) -> np.ndarray:
+        """Refine each circle's radius by finding the peak edge response
+        along radial samples around the detected centre."""
+        edges = cv2.Canny(gray, 30, 100)
+        refined = []
+        for x, y, r in circles:
+            best_r, best_score = r, -1
+            for candidate_r in range(max(1, r - 8), r + 9):
+                mask = np.zeros_like(edges)
+                cv2.circle(mask, (x, y), candidate_r, 255, 2)
+                score = int(cv2.countNonZero(cv2.bitwise_and(edges, mask)))
+                if score > best_score:
+                    best_score = score
+                    best_r = candidate_r
+            refined.append([x, y, best_r])
+        return np.array(refined, dtype=int)
 
     def _build_coins(self, image: np.ndarray, circles: np.ndarray) -> List[Coin]:
         """
@@ -333,20 +394,19 @@ class CoinDetector:
             cv2.circle(annotated, (x, y), r, outline, 2)
             cv2.circle(annotated, (x, y), 3, (0, 255, 0), -1)
 
-            label_text = f"{coin.label} ${coin.value:.2f}"
+            label_text = f"{coin.label}"
+            value_text = f"${coin.value:.2f}"
             font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = max(0.4, r / 50)
-            thickness = max(1, int(font_scale * 1.5))
+            font_scale = r / 80
+            thickness = 1
 
-            (tw, th), _ = cv2.getTextSize(label_text, font, font_scale, thickness)
-            tx = max(0, x - tw // 2)
-            ty = max(th + 2, y - r - 5)
-
-            cv2.putText(annotated, label_text, (tx, ty),
-                        font, font_scale, (255, 255, 255), thickness + 1,
-                        cv2.LINE_AA)
-            cv2.putText(annotated, label_text, (tx, ty),
-                        font, font_scale, (0, 0, 0), thickness,
-                        cv2.LINE_AA)
+            for i, text in enumerate([label_text, value_text]):
+                (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+                tx = x - tw // 2
+                ty = y - th // 2 + i * (th + 4)
+                cv2.putText(annotated, text, (tx, ty), font, font_scale,
+                            (255, 255, 255), thickness + 1, cv2.LINE_AA)
+                cv2.putText(annotated, text, (tx, ty), font, font_scale,
+                            (0, 0, 0), thickness, cv2.LINE_AA)
 
         return annotated
