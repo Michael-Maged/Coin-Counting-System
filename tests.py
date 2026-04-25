@@ -41,18 +41,20 @@ class TestColourCategory:
         assert _colour_category(grey) == "silver"
 
     def test_copper_hue(self):
-        # Approximate copper: BGR ≈ (50, 80, 185)
-        copper = np.zeros((40, 40, 3), dtype=np.uint8)
-        copper[:] = (50, 80, 185)
+        import cv2
+        # Build a patch with H=12 (centre of copper range 5–20), S=200, V=180
+        hsv = np.full((40, 40, 3), (12, 200, 180), dtype=np.uint8)
+        copper = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
         result = _colour_category(copper)
-        assert result in ("copper", "gold")  # hue boundary is fuzzy in uint8
+        assert result == "copper"
 
     def test_gold_hue(self):
-        # Approximate gold: BGR ≈ (0, 180, 220)
-        gold_patch = np.zeros((40, 40, 3), dtype=np.uint8)
-        gold_patch[:] = (0, 180, 220)
+        import cv2
+        # Build a patch with H=30 (centre of gold range 20–40), S=200, V=200
+        hsv = np.full((40, 40, 3), (30, 200, 200), dtype=np.uint8)
+        gold_patch = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
         result = _colour_category(gold_patch)
-        assert result in ("gold", "copper", "silver")  # implementation-defined for edge hues
+        assert result == "gold"
 
 
 # ---------------------------------------------------------------------------
