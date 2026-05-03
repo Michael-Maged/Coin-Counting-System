@@ -179,30 +179,45 @@ class CoinDetector:
         Higher values speed up processing at the cost of accuracy (default 1.2).
     min_dist_factor : float
         Minimum distance between circle centres as a fraction of the image
-        short-side (default 0.05).
+        short-side (default 0.3).
     param1 : int
-        Upper Canny threshold for the internal edge detector (default 100).
+        Upper Canny threshold for the internal edge detector (default 85).
     param2 : int
         Accumulator threshold for circle detection; lower finds more circles
-        (default 30).
+        (default 55).
     min_radius_factor : float
-        Minimum circle radius as a fraction of the image short-side (default 0.02).
+        Minimum circle radius as a fraction of the image short-side (default 0.04).
     max_radius_factor : float
-        Maximum circle radius as a fraction of the image short-side (default 0.35).
+        Maximum circle radius as a fraction of the image short-side (default 0.4).
     blur_ksize : int
         Gaussian blur kernel size applied before Hough detection (default 7).
+    median_ksize : int
+        Median blur kernel size for salt-and-pepper noise removal (default 3).
+    relax_param2_factor : float
+        Multiplier for the second-pass Hough accumulator threshold (default 1.0).
+    relax_min_dist_factor : float
+        Multiplier for the second-pass minimum center distance (default 1.0).
+    dedupe_dist_factor : float
+        Center-distance fraction for duplicate suppression (default 0.8).
+    dedupe_radius_factor : float
+        Allowed radius difference fraction for duplicates (default 0.4).
     """
 
     def __init__(
         self,
         coin_table: Optional[list] = None,
         dp: float = 1.2,
-        min_dist_factor: float = 0.10,
-        param1: int = 100,
-        param2: int = 70,
+        min_dist_factor: float = 0.3,
+        param1: int = 85,
+        param2: int = 55,
         min_radius_factor: float = 0.04,
-        max_radius_factor: float = 0.35,
+        max_radius_factor: float = 0.4,
         blur_ksize: int = 7,
+        median_ksize: int = 3,
+        relax_param2_factor: float = 1.0,
+        relax_min_dist_factor: float = 1.0,
+        dedupe_dist_factor: float = 0.8,
+        dedupe_radius_factor: float = 0.4,
     ):
         self.coin_table = coin_table if coin_table is not None else US_COIN_TABLE
         self.dp = dp
@@ -212,6 +227,11 @@ class CoinDetector:
         self.min_radius_factor = min_radius_factor
         self.max_radius_factor = max_radius_factor
         self.blur_ksize = blur_ksize
+        self.median_ksize = median_ksize
+        self.relax_param2_factor = relax_param2_factor
+        self.relax_min_dist_factor = relax_min_dist_factor
+        self.dedupe_dist_factor = dedupe_dist_factor
+        self.dedupe_radius_factor = dedupe_radius_factor
 
     # ------------------------------------------------------------------
     # Public API
@@ -293,8 +313,11 @@ class CoinDetector:
         return img
 
     def _preprocess(self, image: np.ndarray) -> np.ndarray:
-        """Convert to grayscale and apply Gaussian blur."""
+        """Convert to grayscale and reduce noise before Hough detection."""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        median_ksize = self.median_ksize | 1  # ensure odd
+        if median_ksize > 1:
+            gray = cv2.medianBlur(gray, median_ksize)
         ksize = self.blur_ksize | 1   # ensure odd
         return cv2.GaussianBlur(gray, (ksize, ksize), 2)
 
@@ -320,34 +343,75 @@ class CoinDetector:
         # Scale param2 down for small images (target: param2=70 at 317px, 45 at 135px)
         param2 = max(10, int(self.param2 * (0.35 + 0.65 * min(1.0, short_side / 317))))
 
-        circles = cv2.HoughCircles(
-            gray,
-            cv2.HOUGH_GRADIENT,
-            dp=self.dp,
-            minDist=min_dist,
-            param1=self.param1,
-            param2=param2,
-            minRadius=min_radius,
-            maxRadius=max_radius,
-        )
+        all_circles = []
+        passes = [(min_dist, param2)]
+        if self.relax_param2_factor < 1.0 or self.relax_min_dist_factor < 1.0:
+            passes.append(
+                (max(1, int(min_dist * self.relax_min_dist_factor)),
+                 max(10, int(param2 * self.relax_param2_factor)))
+            )
 
-        if circles is not None:
-            circles = np.round(circles[0]).astype(int)
-            circles = self._refine_radii(gray, circles)
+        for pass_min_dist, pass_param2 in passes:
+            circles = cv2.HoughCircles(
+                gray,
+                cv2.HOUGH_GRADIENT,
+                dp=self.dp,
+                minDist=pass_min_dist,
+                param1=self.param1,
+                param2=pass_param2,
+                minRadius=min_radius,
+                maxRadius=max_radius,
+            )
+            if circles is not None:
+                all_circles.append(np.round(circles[0]).astype(int))
+
+        if not all_circles:
+            return None
+
+        circles = np.vstack(all_circles)
+        edges = cv2.Canny(gray, 30, 100)
+        circles = self._refine_radii(edges, circles)
+        circles = self._dedupe_circles(circles, edges)
 
         return circles
 
-    def _refine_radii(self, gray: np.ndarray, circles: np.ndarray) -> np.ndarray:
+    def _circle_edge_score(self, edges: np.ndarray, x: int, y: int, r: int) -> int:
+        """Return edge support along the circle circumference."""
+        mask = np.zeros_like(edges)
+        cv2.circle(mask, (x, y), r, 255, 2)
+        return int(cv2.countNonZero(cv2.bitwise_and(edges, mask)))
+
+    def _dedupe_circles(self, circles: np.ndarray, edges: np.ndarray) -> np.ndarray:
+        """Remove near-duplicate circles based on center distance and radius."""
+        if circles.size == 0:
+            return circles
+
+        scored = []
+        for x, y, r in circles.tolist():
+            scored.append((self._circle_edge_score(edges, x, y, r), x, y, r))
+
+        kept = []
+        for _, x, y, r in sorted(scored, key=lambda t: t[0], reverse=True):
+            is_dup = False
+            for kx, ky, kr in kept:
+                dist = np.hypot(x - kx, y - ky)
+                if dist <= self.dedupe_dist_factor * max(r, kr):
+                    if abs(r - kr) <= self.dedupe_radius_factor * min(r, kr):
+                        is_dup = True
+                        break
+            if not is_dup:
+                kept.append((x, y, r))
+
+        return np.array(kept, dtype=int)
+
+    def _refine_radii(self, edges: np.ndarray, circles: np.ndarray) -> np.ndarray:
         """Refine each circle's radius by finding the peak edge response
         along radial samples around the detected centre."""
-        edges = cv2.Canny(gray, 30, 100)
         refined = []
         for x, y, r in circles:
             best_r, best_score = r, -1
             for candidate_r in range(max(1, r - 8), r + 9):
-                mask = np.zeros_like(edges)
-                cv2.circle(mask, (x, y), candidate_r, 255, 2)
-                score = int(cv2.countNonZero(cv2.bitwise_and(edges, mask)))
+                score = self._circle_edge_score(edges, int(x), int(y), int(candidate_r))
                 if score > best_score:
                     best_score = score
                     best_r = candidate_r
