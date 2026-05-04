@@ -179,30 +179,39 @@ class CoinDetector:
         Higher values speed up processing at the cost of accuracy (default 1.2).
     min_dist_factor : float
         Minimum distance between circle centres as a fraction of the image
-        short-side (default 0.05).
+        short-side (default 0.3).
     param1 : int
-        Upper Canny threshold for the internal edge detector (default 100).
+        Upper Canny threshold for the internal edge detector (default 85).
     param2 : int
         Accumulator threshold for circle detection; lower finds more circles
-        (default 30).
+        (default 55).
     min_radius_factor : float
-        Minimum circle radius as a fraction of the image short-side (default 0.02).
+        Minimum circle radius as a fraction of the image short-side (default 0.04).
     max_radius_factor : float
-        Maximum circle radius as a fraction of the image short-side (default 0.35).
+        Maximum circle radius as a fraction of the image short-side (default 0.4).
     blur_ksize : int
         Gaussian blur kernel size applied before Hough detection (default 7).
+    median_ksize : int
+        Median blur kernel size for salt-and-pepper noise removal (default 3).
+    dedupe_dist_factor : float
+        Center-distance fraction for duplicate suppression (default 0.8).
+    dedupe_radius_factor : float
+        Allowed radius difference fraction for duplicates (default 0.4).
     """
 
     def __init__(
         self,
         coin_table: Optional[list] = None,
         dp: float = 1.2,
-        min_dist_factor: float = 0.10,
-        param1: int = 100,
-        param2: int = 70,
+        min_dist_factor: float = 0.3,
+        param1: int = 85,
+        param2: int = 55,
         min_radius_factor: float = 0.04,
-        max_radius_factor: float = 0.35,
+        max_radius_factor: float = 0.4,
         blur_ksize: int = 7,
+        median_ksize: int = 3,
+        dedupe_dist_factor: float = 0.8,
+        dedupe_radius_factor: float = 0.4,
     ):
         self.coin_table = coin_table if coin_table is not None else US_COIN_TABLE
         self.dp = dp
@@ -212,6 +221,9 @@ class CoinDetector:
         self.min_radius_factor = min_radius_factor
         self.max_radius_factor = max_radius_factor
         self.blur_ksize = blur_ksize
+        self.median_ksize = median_ksize
+        self.dedupe_dist_factor = dedupe_dist_factor
+        self.dedupe_radius_factor = dedupe_radius_factor
 
     # ------------------------------------------------------------------
     # Public API
@@ -293,8 +305,16 @@ class CoinDetector:
         return img
 
     def _preprocess(self, image: np.ndarray) -> np.ndarray:
-        """Convert to grayscale and apply Gaussian blur."""
+        """Convert to grayscale and reduce noise before Hough detection."""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        median_ksize = self.median_ksize | 1  # ensure odd
+        if median_ksize > 1:
+            gray = cv2.medianBlur(gray, median_ksize)
+            # Second pass: suppress heavy salt-and-pepper noise
+            med = cv2.medianBlur(gray, median_ksize)
+            noise_mean = float(np.abs(gray.astype(np.int32) - med.astype(np.int32)).mean())
+            if noise_mean > 1.5:
+                gray = med
         ksize = self.blur_ksize | 1   # ensure odd
         return cv2.GaussianBlur(gray, (ksize, ksize), 2)
 
@@ -306,20 +326,25 @@ class CoinDetector:
         min_radius = max(1, int(short_side * self.min_radius_factor))
         max_radius = int(short_side * self.max_radius_factor)
 
-        # Use watershed to estimate coin count and set minDist accordingly
+        # Scale param2 down for small images
+        param2 = max(10, int(self.param2 * (0.35 + 0.65 * min(1.0, short_side / 317))))
+
+        # Use watershed to estimate a lower-bound on minDist, but cap it
+        # so it never exceeds min_radius_factor * short_side (avoids suppressing
+        # closely-packed or angled coins where watershed is unreliable)
         ws_centers = self._watershed_centers(gray)
+        cap = max(1, int(short_side * self.min_dist_factor))
         if ws_centers is not None and len(ws_centers) >= 2:
-            # Compute minimum pairwise distance between watershed centres
             from scipy.spatial.distance import cdist
             dists = cdist(ws_centers, ws_centers)
             np.fill_diagonal(dists, np.inf)
-            min_dist = max(1, int(dists.min() * 0.8))
+            ws_min_dist = max(1, int(dists.min() * 0.8))
+            min_dist = min(ws_min_dist, cap)
         else:
-            min_dist = max(1, int(short_side * self.min_dist_factor))
+            min_dist = cap
 
-        # Scale param2 down for small images (target: param2=70 at 317px, 45 at 135px)
-        param2 = max(10, int(self.param2 * (0.35 + 0.65 * min(1.0, short_side / 317))))
-
+        # Two passes: tight first pass; relaxed second pass only if first finds nothing
+        all_circles = []
         circles = cv2.HoughCircles(
             gray,
             cv2.HOUGH_GRADIENT,
@@ -330,24 +355,72 @@ class CoinDetector:
             minRadius=min_radius,
             maxRadius=max_radius,
         )
-
         if circles is not None:
-            circles = np.round(circles[0]).astype(int)
-            circles = self._refine_radii(gray, circles)
+            all_circles.append(np.round(circles[0]).astype(int))
+        else:
+            # Relaxed fallback: lower param2 and minDist to catch difficult images
+            relaxed_dist = max(1, int(min_dist * 0.5))
+            relaxed_p2   = max(10, int(param2 * 0.55))
+            circles = cv2.HoughCircles(
+                gray,
+                cv2.HOUGH_GRADIENT,
+                dp=self.dp,
+                minDist=relaxed_dist,
+                param1=self.param1,
+                param2=relaxed_p2,
+                minRadius=min_radius,
+                maxRadius=max_radius,
+            )
+            if circles is not None:
+                all_circles.append(np.round(circles[0]).astype(int))
+
+        if not all_circles:
+            return None
+
+        circles = np.vstack(all_circles)
+        edges = cv2.Canny(gray, 30, 100)
+        circles = self._refine_radii(edges, circles)
+        circles = self._dedupe_circles(circles, edges)
 
         return circles
 
-    def _refine_radii(self, gray: np.ndarray, circles: np.ndarray) -> np.ndarray:
+    def _circle_edge_score(self, edges: np.ndarray, x: int, y: int, r: int) -> int:
+        """Return edge support along the circle circumference."""
+        mask = np.zeros_like(edges)
+        cv2.circle(mask, (x, y), r, 255, 2)
+        return int(cv2.countNonZero(cv2.bitwise_and(edges, mask)))
+
+    def _dedupe_circles(self, circles: np.ndarray, edges: np.ndarray) -> np.ndarray:
+        """Remove near-duplicate circles based on center distance and radius."""
+        if circles.size == 0:
+            return circles
+
+        scored = []
+        for x, y, r in circles.tolist():
+            scored.append((self._circle_edge_score(edges, x, y, r), x, y, r))
+
+        kept = []
+        for _, x, y, r in sorted(scored, key=lambda t: t[0], reverse=True):
+            is_dup = False
+            for kx, ky, kr in kept:
+                dist = np.hypot(x - kx, y - ky)
+                if dist <= self.dedupe_dist_factor * max(r, kr):
+                    if abs(r - kr) <= self.dedupe_radius_factor * min(r, kr):
+                        is_dup = True
+                        break
+            if not is_dup:
+                kept.append((x, y, r))
+
+        return np.array(kept, dtype=int)
+
+    def _refine_radii(self, edges: np.ndarray, circles: np.ndarray) -> np.ndarray:
         """Refine each circle's radius by finding the peak edge response
         along radial samples around the detected centre."""
-        edges = cv2.Canny(gray, 30, 100)
         refined = []
         for x, y, r in circles:
             best_r, best_score = r, -1
             for candidate_r in range(max(1, r - 8), r + 9):
-                mask = np.zeros_like(edges)
-                cv2.circle(mask, (x, y), candidate_r, 255, 2)
-                score = int(cv2.countNonZero(cv2.bitwise_and(edges, mask)))
+                score = self._circle_edge_score(edges, int(x), int(y), int(candidate_r))
                 if score > best_score:
                     best_score = score
                     best_r = candidate_r
