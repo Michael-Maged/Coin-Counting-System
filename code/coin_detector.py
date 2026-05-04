@@ -193,10 +193,6 @@ class CoinDetector:
         Gaussian blur kernel size applied before Hough detection (default 7).
     median_ksize : int
         Median blur kernel size for salt-and-pepper noise removal (default 3).
-    relax_param2_factor : float
-        Multiplier for the second-pass Hough accumulator threshold (default 1.0).
-    relax_min_dist_factor : float
-        Multiplier for the second-pass minimum center distance (default 1.0).
     dedupe_dist_factor : float
         Center-distance fraction for duplicate suppression (default 0.8).
     dedupe_radius_factor : float
@@ -214,8 +210,6 @@ class CoinDetector:
         max_radius_factor: float = 0.4,
         blur_ksize: int = 7,
         median_ksize: int = 3,
-        relax_param2_factor: float = 1.0,
-        relax_min_dist_factor: float = 1.0,
         dedupe_dist_factor: float = 0.8,
         dedupe_radius_factor: float = 0.4,
     ):
@@ -228,8 +222,6 @@ class CoinDetector:
         self.max_radius_factor = max_radius_factor
         self.blur_ksize = blur_ksize
         self.median_ksize = median_ksize
-        self.relax_param2_factor = relax_param2_factor
-        self.relax_min_dist_factor = relax_min_dist_factor
         self.dedupe_dist_factor = dedupe_dist_factor
         self.dedupe_radius_factor = dedupe_radius_factor
 
@@ -318,6 +310,11 @@ class CoinDetector:
         median_ksize = self.median_ksize | 1  # ensure odd
         if median_ksize > 1:
             gray = cv2.medianBlur(gray, median_ksize)
+            # Second pass: suppress heavy salt-and-pepper noise
+            med = cv2.medianBlur(gray, median_ksize)
+            noise_mean = float(np.abs(gray.astype(np.int32) - med.astype(np.int32)).mean())
+            if noise_mean > 1.5:
+                gray = med
         ksize = self.blur_ksize | 1   # ensure odd
         return cv2.GaussianBlur(gray, (ksize, ksize), 2)
 
@@ -329,36 +326,48 @@ class CoinDetector:
         min_radius = max(1, int(short_side * self.min_radius_factor))
         max_radius = int(short_side * self.max_radius_factor)
 
-        # Use watershed to estimate coin count and set minDist accordingly
+        # Scale param2 down for small images
+        param2 = max(10, int(self.param2 * (0.35 + 0.65 * min(1.0, short_side / 317))))
+
+        # Use watershed to estimate a lower-bound on minDist, but cap it
+        # so it never exceeds min_radius_factor * short_side (avoids suppressing
+        # closely-packed or angled coins where watershed is unreliable)
         ws_centers = self._watershed_centers(gray)
+        cap = max(1, int(short_side * self.min_dist_factor))
         if ws_centers is not None and len(ws_centers) >= 2:
-            # Compute minimum pairwise distance between watershed centres
             from scipy.spatial.distance import cdist
             dists = cdist(ws_centers, ws_centers)
             np.fill_diagonal(dists, np.inf)
-            min_dist = max(1, int(dists.min() * 0.8))
+            ws_min_dist = max(1, int(dists.min() * 0.8))
+            min_dist = min(ws_min_dist, cap)
         else:
-            min_dist = max(1, int(short_side * self.min_dist_factor))
+            min_dist = cap
 
-        # Scale param2 down for small images (target: param2=70 at 317px, 45 at 135px)
-        param2 = max(10, int(self.param2 * (0.35 + 0.65 * min(1.0, short_side / 317))))
-
+        # Two passes: tight first pass; relaxed second pass only if first finds nothing
         all_circles = []
-        passes = [(min_dist, param2)]
-        if self.relax_param2_factor < 1.0 or self.relax_min_dist_factor < 1.0:
-            passes.append(
-                (max(1, int(min_dist * self.relax_min_dist_factor)),
-                 max(10, int(param2 * self.relax_param2_factor)))
-            )
-
-        for pass_min_dist, pass_param2 in passes:
+        circles = cv2.HoughCircles(
+            gray,
+            cv2.HOUGH_GRADIENT,
+            dp=self.dp,
+            minDist=min_dist,
+            param1=self.param1,
+            param2=param2,
+            minRadius=min_radius,
+            maxRadius=max_radius,
+        )
+        if circles is not None:
+            all_circles.append(np.round(circles[0]).astype(int))
+        else:
+            # Relaxed fallback: lower param2 and minDist to catch difficult images
+            relaxed_dist = max(1, int(min_dist * 0.5))
+            relaxed_p2   = max(10, int(param2 * 0.55))
             circles = cv2.HoughCircles(
                 gray,
                 cv2.HOUGH_GRADIENT,
                 dp=self.dp,
-                minDist=pass_min_dist,
+                minDist=relaxed_dist,
                 param1=self.param1,
-                param2=pass_param2,
+                param2=relaxed_p2,
                 minRadius=min_radius,
                 maxRadius=max_radius,
             )
