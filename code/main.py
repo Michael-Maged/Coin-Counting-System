@@ -52,18 +52,6 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def _print_summary(image_name, result):
-    print(f"\n{'='*50}")
-    print(f"  {image_name}")
-    print(f"{'='*50}")
-    print(f"  Coins found : {len(result.coins)}")
-    if result.coins:
-        counts = Counter(c.label for c in result.coins)
-        for label, count in sorted(counts.items()):
-            unit_value = next(c.value for c in result.coins if c.label == label)
-            print(f"    {label:12s} x{count}  (${unit_value:.2f} each)")
-    print(f"  Total value : ${result.total_value:.2f}")
-    print(f"{'='*50}")
 
 
 def main(argv=None):
@@ -90,7 +78,6 @@ def main(argv=None):
             except ValueError as exc:
                 print(f"Error processing {img_path.name}: {exc}", file=sys.stderr)
                 continue
-            _print_summary(img_path.name, result)
             out_path = results_dir / img_path.name
             cv2.imwrite(str(out_path), result.annotated_image)  # type: ignore
             print(f"  Saved -> {out_path}")
@@ -106,7 +93,6 @@ def main(argv=None):
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    _print_summary(input_path.name, result)
 
     if args.output:
         cv2.imwrite(args.output, result.annotated_image)  # type: ignore
@@ -114,7 +100,6 @@ def main(argv=None):
 
     if not args.no_display:
         cv2.imshow("Coin Detection", result.annotated_image)  # type: ignore
-        print("Press any key to close the window …")
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 

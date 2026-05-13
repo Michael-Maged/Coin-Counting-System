@@ -9,7 +9,6 @@ Typical usage
 >>> from coin_detector import CoinDetector
 >>> detector = CoinDetector()
 >>> results = detector.detect("coins.jpg")
->>> print(results.total_value)
 """
 
 import cv2
@@ -29,7 +28,6 @@ class Coin:
     y: int                     # circle centre y (pixels)
     radius: int                # circle radius   (pixels)
     label: str = "unknown"     # coin denomination label
-    value: float = 0.0         # monetary value
     color_name: str = "unknown"  # dominant color group ("gold", "silver", "copper")
     bgr_mean: Tuple[float, float, float] = field(default_factory=lambda: (0.0, 0.0, 0.0))
 
@@ -38,7 +36,6 @@ class Coin:
 class DetectionResult:
     """Full result returned by :meth:`CoinDetector.detect`."""
     coins: List[Coin] = field(default_factory=list)
-    total_value: float = 0.0
     annotated_image: Optional[np.ndarray] = None
 
 
@@ -54,13 +51,13 @@ class DetectionResult:
 # to other currencies by subclassing and overriding `COIN_TABLE`.
 
 US_COIN_TABLE = [
-    # label,    value,  color,     min_r,  max_r
-    ("dime",    0.10,  "silver",   0.70,   0.92),
-    ("penny",   0.01,  "copper",   0.75,   1.15),
-    ("nickel",  0.05,  "silver",   0.93,   1.15),
-    ("quarter", 0.25,  "silver",   1.10,   1.40),
-    ("half",    0.50,  "silver",   1.35,   1.80),
-    ("dollar",  1.00,  "gold",     1.50,   2.20),
+    # label,    color,     min_r,  max_r
+    ("dime",    "silver",   0.70,   0.92),
+    ("penny",   "copper",   0.75,   1.15),
+    ("nickel",  "silver",   0.93,   1.15),
+    ("quarter", "silver",   1.10,   1.40),
+    ("half",    "silver",   1.35,   1.80),
+    ("dollar",  "gold",     1.50,   2.20),
 ]
 
 # Color group boundaries in HSV space
@@ -122,10 +119,10 @@ def _sample_coin_color(image_bgr: np.ndarray, x: int, y: int, radius: int,
 
 def _classify_coin(radius: int, color_name: str,
                    median_radius: float,
-                   coin_table: list) -> Tuple[str, float]:
+                   coin_table: list) -> str:
     """
-    Return (label, value) by matching *radius* against the relative-size
-    table and verifying color when the table specifies one.
+    Return label by matching *radius* against the relative-size table and
+    verifying color when the table specifies one.
 
     Strategy:
     1. Exact match: size range AND color both match.
@@ -134,31 +131,29 @@ def _classify_coin(radius: int, color_name: str,
     4. Closest ratio: pick the entry with the nearest midpoint.
     """
     if median_radius <= 0:
-        return "unknown", 0.0
+        return "unknown"
 
     ratio = radius / median_radius
 
     # 1. Exact match (size range + color)
-    for label, value, color_group, min_r, max_r in coin_table:
+    for label, color_group, min_r, max_r in coin_table:
         if min_r <= ratio <= max_r and (color_group == color_name or color_group == "any"):
-            return label, value
+            return label
 
     # 2. Color matches — pick closest midpoint among color-matching entries
-    color_candidates = [(label, value, (min_r + max_r) / 2)
-                        for label, value, color_group, min_r, max_r in coin_table
+    color_candidates = [(label, (min_r + max_r) / 2)
+                        for label, color_group, min_r, max_r in coin_table
                         if color_group == color_name or color_group == "any"]
     if color_candidates:
-        best = min(color_candidates, key=lambda t: abs(t[2] - ratio))
-        return best[0], best[1]
+        return min(color_candidates, key=lambda t: abs(t[1] - ratio))[0]
 
     # 3. Size-only fallback
-    for label, value, color_group, min_r, max_r in coin_table:
+    for label, color_group, min_r, max_r in coin_table:
         if min_r <= ratio <= max_r:
-            return label, value
+            return label
 
     # 4. Closest ratio overall
-    best = min(coin_table, key=lambda row: abs((row[3] + row[4]) / 2 - ratio))
-    return best[0], best[1]
+    return min(coin_table, key=lambda row: abs((row[2] + row[3]) / 2 - ratio))[0]
 
 
 # ---------------------------------------------------------------------------
@@ -264,8 +259,8 @@ class CoinDetector:
         Returns
         -------
         DetectionResult
-            A dataclass containing the list of :class:`Coin` objects, the
-            computed total value, and an annotated copy of the image.
+            A dataclass containing the list of :class:`Coin` objects and an
+            annotated copy of the image.
 
         Raises
         ------
@@ -277,18 +272,12 @@ class CoinDetector:
         circles = self._hough_detect(image, gray)
 
         if circles is None or len(circles) == 0:
-            return DetectionResult(
-                coins=[],
-                total_value=0.0,
-                annotated_image=image.copy(),
-            )
+            return DetectionResult(coins=[], annotated_image=image.copy())
 
         coins = self._build_coins(image, circles)
-        total_value = sum(c.value for c in coins)
         annotated = self._draw_annotations(image, coins)
 
-        return DetectionResult(coins=coins, total_value=total_value,
-                               annotated_image=annotated)
+        return DetectionResult(coins=coins, annotated_image=annotated)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -439,12 +428,10 @@ class CoinDetector:
         for x, y, r in circles:
             bgr_mean = _sample_coin_color(image, int(x), int(y), int(r))
             color_name = _bgr_to_color_name(bgr_mean)
-            label, value = _classify_coin(int(r), color_name,
-                                          median_radius, self.coin_table)
+            label = _classify_coin(int(r), color_name, median_radius, self.coin_table)
             coins.append(Coin(
                 x=int(x), y=int(y), radius=int(r),
-                label=label, value=value,
-                color_name=color_name, bgr_mean=bgr_mean,
+                label=label, color_name=color_name, bgr_mean=bgr_mean,
             ))
 
         return coins
@@ -467,19 +454,16 @@ class CoinDetector:
             cv2.circle(annotated, (x, y), r, outline, 2)
             cv2.circle(annotated, (x, y), 3, (0, 255, 0), -1)
 
-            label_text = f"{coin.label}"
-            value_text = f"${coin.value:.2f}"
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = r / 80
             thickness = 1
 
-            for i, text in enumerate([label_text, value_text]):
-                (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
-                tx = x - tw // 2
-                ty = y - th // 2 + i * (th + 4)
-                cv2.putText(annotated, text, (tx, ty), font, font_scale,
-                            (255, 255, 255), thickness + 1, cv2.LINE_AA)
-                cv2.putText(annotated, text, (tx, ty), font, font_scale,
-                            (0, 0, 0), thickness, cv2.LINE_AA)
+            (tw, th), _ = cv2.getTextSize(coin.label, font, font_scale, thickness)
+            tx = x - tw // 2
+            ty = y + th // 2
+            cv2.putText(annotated, coin.label, (tx, ty), font, font_scale,
+                        (255, 255, 255), thickness + 1, cv2.LINE_AA)
+            cv2.putText(annotated, coin.label, (tx, ty), font, font_scale,
+                        (0, 0, 0), thickness, cv2.LINE_AA)
 
         return annotated
