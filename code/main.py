@@ -1,20 +1,3 @@
-"""
-main.py
-=======
-Command-line interface for the Coin Counting System.
-
-Usage
------
-    python main.py <image_path> [--output <output_path>] [--no-display]
-    python main.py <folder_path>   # batch mode -> saves to results/
-
-Examples
---------
-    python main.py coins.jpg
-    python main.py coins.jpg --output result.jpg --no-display
-    python main.py tests/
-"""
-
 import argparse
 import os
 import sys
@@ -51,9 +34,6 @@ def parse_args(argv=None):
     )
     return parser.parse_args(argv)
 
-
-
-
 def main(argv=None):
     args = parse_args(argv)
     detector = CoinDetector(param2=args.param2)
@@ -84,27 +64,6 @@ def main(argv=None):
 
         return 0
 
-    # ------------------------------------------------------------------ #
-    # Single image mode                                                    #
-    # ------------------------------------------------------------------ #
-    try:
-        result = detector.detect(str(input_path))
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-
-
-    if args.output:
-        cv2.imwrite(args.output, result.annotated_image)  # type: ignore
-        print(f"Annotated image saved to: {args.output}")
-
-    if not args.no_display:
-        cv2.imshow("Coin Detection", result.annotated_image)  # type: ignore
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-
-    return 0
-
-
+    
 if __name__ == "__main__":
     sys.exit(main())

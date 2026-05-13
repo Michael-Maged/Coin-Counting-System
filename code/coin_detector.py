@@ -1,26 +1,7 @@
-"""
-coin_detector.py
-================
-Detect and classify coins in an image using the circular Hough transform
-combined with size and color features.
-
-Typical usage
--------------
->>> from coin_detector import CoinDetector
->>> detector = CoinDetector()
->>> results = detector.detect("coins.jpg")
-"""
-
 import cv2
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
-
-
-# ---------------------------------------------------------------------------
-# Data types
-# ---------------------------------------------------------------------------
-
 @dataclass
 class Coin:
     """Represents a single detected coin."""
@@ -31,26 +12,13 @@ class Coin:
     color_name: str = "unknown"  # dominant color group ("gold", "silver", "copper")
     bgr_mean: Tuple[float, float, float] = field(default_factory=lambda: (0.0, 0.0, 0.0))
 
-
 @dataclass
 class DetectionResult:
     """Full result returned by :meth:`CoinDetector.detect`."""
     coins: List[Coin] = field(default_factory=list)
     annotated_image: Optional[np.ndarray] = None
 
-
-# ---------------------------------------------------------------------------
-# Coin classification tables
-# ---------------------------------------------------------------------------
-
-# Each entry: (label, value, color_group, min_radius_ratio, max_radius_ratio)
-# radius_ratio = coin_radius / median_radius  – this makes classification
-# robust to different image scales / resolutions.
-#
-# The table below covers both US coins and a generic set that can be adapted
-# to other currencies by subclassing and overriding `COIN_TABLE`.
-
-US_COIN_TABLE = [
+COIN_TABLE = [
     # label,    color,     min_r,  max_r
     ("dime",    "silver",   0.70,   0.92),
     ("penny",   "copper",   0.75,   1.15),
@@ -208,7 +176,7 @@ class CoinDetector:
         dedupe_dist_factor: float = 0.8,
         dedupe_radius_factor: float = 0.4,
     ):
-        self.coin_table = coin_table if coin_table is not None else US_COIN_TABLE
+        self.coin_table = coin_table if coin_table is not None else COIN_TABLE
         self.dp = dp
         self.min_dist_factor = min_dist_factor
         self.param1 = param1
